@@ -91,7 +91,7 @@ refcount_destroy_many(refcount_t *rc, uint64_t number)
 {
 	reference_t *ref;
 
-	ASSERT(rc->rc_count == number);
+	ASSERT3U(rc->rc_count, ==, number);
 	while (ref = list_head(&rc->rc_list)) {
 		list_remove(&rc->rc_list, ref);
 		kmem_cache_free(reference_cache, ref);

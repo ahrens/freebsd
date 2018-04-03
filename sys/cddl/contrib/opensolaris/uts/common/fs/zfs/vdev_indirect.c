@@ -1078,6 +1078,13 @@ vdev_indirect_io_start_cb(uint64_t split_offset, vdev_t *vd, uint64_t offset,
 	if (vd->vdev_ops == &vdev_indirect_ops)
 		return;
 
+	printf("vdev_indirect_io_start_cb: src=%llx split_offset=%x dst: vd=%u off=%llx size=%x\n",
+		(long long)zio->io_offset,
+		(int)split_offset,
+		(int)vd->vdev_id,
+		(long long)offset,
+		(int)size);
+
 	zio_nowait(zio_vdev_child_io(zio, NULL, vd, offset,
 	    abd_get_offset(zio->io_abd, split_offset),
 	    size, zio->io_type, zio->io_priority,

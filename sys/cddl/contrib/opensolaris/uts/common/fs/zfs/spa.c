@@ -55,6 +55,7 @@
 #include <sys/vdev_removal.h>
 #include <sys/vdev_indirect_mapping.h>
 #include <sys/vdev_indirect_births.h>
+#include <sys/vdev_raidz.h>
 #include <sys/metaslab.h>
 #include <sys/metaslab_impl.h>
 #include <sys/uberblock_impl.h>
@@ -5923,8 +5924,9 @@ spa_vdev_attach(spa_t *spa, uint64_t guid, nvlist_t *nvroot, int replacing)
 	vdev_t *oldvd, *newvd, *newrootvd, *pvd, *tvd;
 	vdev_ops_t *pvops;
 	char *oldvdpath, *newvdpath;
-	int newvd_isspare;
+	int newvd_isspare = B_FALSE;
 	int error;
+	boolean_t raidz = B_FALSE;
 
 	ASSERT(spa_writeable(spa));
 
@@ -5947,10 +5949,16 @@ spa_vdev_attach(spa_t *spa, uint64_t guid, nvlist_t *nvroot, int replacing)
 	if (oldvd == NULL)
 		return (spa_vdev_exit(spa, NULL, txg, ENODEV));
 
-	if (!oldvd->vdev_ops->vdev_op_leaf)
+	if (oldvd->vdev_ops == &vdev_raidz_ops) {
+		raidz = B_TRUE;
+	} else if (!oldvd->vdev_ops->vdev_op_leaf) {
 		return (spa_vdev_exit(spa, NULL, txg, ENOTSUP));
+	}
 
-	pvd = oldvd->vdev_parent;
+	if (raidz)
+		pvd = oldvd;
+	else
+		pvd = oldvd->vdev_parent;
 
 	if ((error = spa_config_parse(spa, &newrootvd, nvroot, NULL, 0,
 	    VDEV_ALLOC_ATTACH)) != 0)
@@ -5979,6 +5987,7 @@ spa_vdev_attach(spa_t *spa, uint64_t guid, nvlist_t *nvroot, int replacing)
 		 * vdev.
 		 */
 		if (pvd->vdev_ops != &vdev_mirror_ops &&
+		    pvd->vdev_ops != &vdev_raidz_ops &&
 		    pvd->vdev_ops != &vdev_root_ops)
 			return (spa_vdev_exit(spa, newrootvd, txg, ENOTSUP));
 
@@ -6018,7 +6027,8 @@ spa_vdev_attach(spa_t *spa, uint64_t guid, nvlist_t *nvroot, int replacing)
 	/*
 	 * Make sure the new device is big enough.
 	 */
-	if (newvd->vdev_asize < vdev_get_min_asize(oldvd))
+	vdev_t *min_vdev = raidz ? oldvd->vdev_child[0] : oldvd;
+	if (newvd->vdev_asize < vdev_get_min_asize(min_vdev))
 		return (spa_vdev_exit(spa, newrootvd, txg, EOVERFLOW));
 
 	/*
@@ -6028,35 +6038,48 @@ spa_vdev_attach(spa_t *spa, uint64_t guid, nvlist_t *nvroot, int replacing)
 	if (newvd->vdev_ashift > oldvd->vdev_top->vdev_ashift)
 		return (spa_vdev_exit(spa, newrootvd, txg, EDOM));
 
+	if (raidz) {
+                oldvdpath = kmem_asprintf("raidz%u-%u",
+                    oldvd->vdev_nparity, oldvd->vdev_id);
+	} else {
+                oldvdpath = spa_strdup(oldvd->vdev_path);
+	}
+        newvdpath = spa_strdup(newvd->vdev_path);
+
 	/*
 	 * If this is an in-place replacement, update oldvd's path and devid
 	 * to make it distinguishable from newvd, and unopenable from now on.
 	 */
-	if (strcmp(oldvd->vdev_path, newvd->vdev_path) == 0) {
+	if (strcmp(oldvdpath, newvdpath) == 0) {
 		spa_strfree(oldvd->vdev_path);
-		oldvd->vdev_path = kmem_alloc(strlen(newvd->vdev_path) + 5,
+		oldvd->vdev_path = kmem_alloc(strlen(newvdpath) + 5,
 		    KM_SLEEP);
-		(void) sprintf(oldvd->vdev_path, "%s/%s",
-		    newvd->vdev_path, "old");
+		(void) sprintf(oldvd->vdev_path, "%s/old",
+		    newvdpath);
 		if (oldvd->vdev_devid != NULL) {
 			spa_strfree(oldvd->vdev_devid);
 			oldvd->vdev_devid = NULL;
 		}
+		spa_strfree(oldvdpath);
+                oldvdpath = spa_strdup(oldvd->vdev_path);
 	}
 
 	/* mark the device being resilvered */
-	newvd->vdev_resilver_txg = txg;
+	if (!raidz)
+		newvd->vdev_resilver_txg = txg;
 
 	/*
 	 * If the parent is not a mirror, or if we're replacing, insert the new
 	 * mirror/replacing/spare vdev above oldvd.
 	 */
-	if (pvd->vdev_ops != pvops)
+	if (!raidz && pvd->vdev_ops != pvops)
 		pvd = vdev_add_parent(oldvd, pvops);
 
 	ASSERT(pvd->vdev_top->vdev_parent == rvd);
+#if 0
 	ASSERT(pvd->vdev_ops == pvops);
 	ASSERT(oldvd->vdev_parent == pvd);
+#endif
 
 	/*
 	 * Extract the new device from its root and add it to pvd.
@@ -6079,29 +6102,34 @@ spa_vdev_attach(spa_t *spa, uint64_t guid, nvlist_t *nvroot, int replacing)
 	 */
 	dtl_max_txg = txg + TXG_CONCURRENT_STATES;
 
-	vdev_dtl_dirty(newvd, DTL_MISSING, TXG_INITIAL,
-	    dtl_max_txg - TXG_INITIAL);
+	if (raidz) {
+		dmu_tx_t *tx = dmu_tx_create_assigned(spa->spa_dsl_pool, txg);
+		dsl_sync_task_nowait(spa->spa_dsl_pool, vdev_raidz_attach_sync,
+		    newvd, 0, ZFS_SPACE_CHECK_EXTRA_RESERVED, tx);
+		dmu_tx_commit(tx);
+	} else {
+                vdev_dtl_dirty(newvd, DTL_MISSING, TXG_INITIAL,
+                    dtl_max_txg - TXG_INITIAL);
 
-	if (newvd->vdev_isspare) {
-		spa_spare_activate(newvd);
-		spa_event_notify(spa, newvd, NULL, ESC_ZFS_VDEV_SPARE);
+                if (newvd->vdev_isspare) {
+                        spa_spare_activate(newvd);
+                        spa_event_notify(spa, newvd, NULL, ESC_ZFS_VDEV_SPARE);
+                }
+
+                newvd_isspare = newvd->vdev_isspare;
+
+                /*
+                 * Mark newvd's DTL dirty in this txg.
+                 */
+                vdev_dirty(tvd, VDD_DTL, newvd, txg);
+
+                /*
+                 * Schedule the resilver to restart in the future. We do this to
+                 * ensure that dmu_sync-ed blocks have been stitched into the
+                 * respective datasets.
+                 */
+                dsl_resilver_restart(spa->spa_dsl_pool, dtl_max_txg);
 	}
-
-	oldvdpath = spa_strdup(oldvd->vdev_path);
-	newvdpath = spa_strdup(newvd->vdev_path);
-	newvd_isspare = newvd->vdev_isspare;
-
-	/*
-	 * Mark newvd's DTL dirty in this txg.
-	 */
-	vdev_dirty(tvd, VDD_DTL, newvd, txg);
-
-	/*
-	 * Schedule the resilver to restart in the future. We do this to
-	 * ensure that dmu_sync-ed blocks have been stitched into the
-	 * respective datasets.
-	 */
-	dsl_resilver_restart(spa->spa_dsl_pool, dtl_max_txg);
 
 	if (spa->spa_bootfs)
 		spa_event_notify(spa, newvd, NULL, ESC_ZFS_BOOTFS_VDEV_ATTACH);
@@ -6112,6 +6140,10 @@ spa_vdev_attach(spa_t *spa, uint64_t guid, nvlist_t *nvroot, int replacing)
 	 * Commit the config
 	 */
 	(void) spa_vdev_exit(spa, newrootvd, dtl_max_txg, 0);
+
+	if (raidz) {
+		error = vdev_online(spa, guid, ZFS_ONLINE_EXPAND, NULL);
+	}
 
 	spa_history_log_internal(spa, "vdev attach", NULL,
 	    "%s vdev=%s %s vdev=%s",

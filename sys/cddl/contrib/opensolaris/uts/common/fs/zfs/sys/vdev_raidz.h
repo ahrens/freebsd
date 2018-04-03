@@ -39,10 +39,18 @@
 extern "C" {
 #endif
 
-#ifdef _KERNEL
+typedef struct vdev_raidz {
+	int vd_logical_width;
+	int vd_physical_width;
+	int vd_nparity;
+	boolean_t vn_expanding;
+} vdev_raidz_t;
+
 extern int vdev_raidz_physio(vdev_t *,
     caddr_t, size_t, uint64_t, uint64_t, boolean_t, boolean_t);
-#endif
+extern void vdev_raidz_attach_sync(void *, dmu_tx_t *);
+extern void vdev_raidz_config_generate(vdev_t *, nvlist_t *);
+extern void *vdev_raidz_get_tsd(spa_t *, nvlist_t *);
 #ifdef	__cplusplus
 }
 #endif

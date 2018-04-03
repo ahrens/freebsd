@@ -49,6 +49,7 @@
 #include <sys/arc.h>
 #include <sys/zil.h>
 #include <sys/dsl_scan.h>
+#include <sys/vdev_raidz.h>
 #include <sys/abd.h>
 #include <sys/trim_map.h>
 
@@ -584,7 +585,7 @@ vdev_alloc(spa_t *spa, vdev_t **vdp, nvlist_t *nv, vdev_t *parent, uint_t id,
 {
 	vdev_ops_t *ops;
 	char *type;
-	uint64_t guid = 0, islog, nparity;
+	uint64_t guid = 0, islog;
 	vdev_t *vd;
 	vdev_indirect_config_t *vic;
 
@@ -637,47 +638,21 @@ vdev_alloc(spa_t *spa, vdev_t **vdp, nvlist_t *nv, vdev_t *parent, uint_t id,
 	if (ops == &vdev_hole_ops && spa_version(spa) < SPA_VERSION_HOLES)
 		return (SET_ERROR(ENOTSUP));
 
-	/*
-	 * Set the nparity property for RAID-Z vdevs.
-	 */
-	nparity = -1ULL;
+	void *tsd = NULL;
+	int nparity = 0;
 	if (ops == &vdev_raidz_ops) {
-		if (nvlist_lookup_uint64(nv, ZPOOL_CONFIG_NPARITY,
-		    &nparity) == 0) {
-			if (nparity == 0 || nparity > VDEV_RAIDZ_MAXPARITY)
-				return (SET_ERROR(EINVAL));
-			/*
-			 * Previous versions could only support 1 or 2 parity
-			 * device.
-			 */
-			if (nparity > 1 &&
-			    spa_version(spa) < SPA_VERSION_RAIDZ2)
-				return (SET_ERROR(ENOTSUP));
-			if (nparity > 2 &&
-			    spa_version(spa) < SPA_VERSION_RAIDZ3)
-				return (SET_ERROR(ENOTSUP));
-		} else {
-			/*
-			 * We require the parity to be specified for SPAs that
-			 * support multiple parity levels.
-			 */
-			if (spa_version(spa) >= SPA_VERSION_RAIDZ2)
-				return (SET_ERROR(EINVAL));
-			/*
-			 * Otherwise, we default to 1 parity device for RAID-Z.
-			 */
-			nparity = 1;
-		}
-	} else {
-		nparity = 0;
+		vdev_raidz_t *rz = tsd = vdev_raidz_get_tsd(spa, nv);
+		if (rz == NULL)
+			return (SET_ERROR(EINVAL));
+		nparity = rz->vd_nparity;
 	}
-	ASSERT(nparity != -1ULL);
 
 	vd = vdev_alloc_common(spa, id, guid, ops);
 	vic = &vd->vdev_indirect_config;
 
 	vd->vdev_islog = islog;
 	vd->vdev_nparity = nparity;
+	vd->vdev_tsd = tsd;
 
 	if (nvlist_lookup_string(nv, ZPOOL_CONFIG_PATH, &vd->vdev_path) == 0)
 		vd->vdev_path = spa_strdup(vd->vdev_path);
@@ -848,6 +823,11 @@ vdev_free(vdev_t *vd)
 
 	ASSERT(vd->vdev_child == NULL);
 	ASSERT(vd->vdev_guid_sum == vd->vdev_guid);
+
+	if (vd->vdev_ops == &vdev_raidz_ops) {
+		vdev_raidz_t *rz = vd->vdev_tsd;
+		kmem_free(rz, sizeof(*rz));
+	}
 
 	/*
 	 * Discard allocation state.
@@ -3155,8 +3135,10 @@ vdev_online(spa_t *spa, uint64_t guid, uint64_t flags, vdev_state_t *newstate)
 	if ((vd = spa_lookup_by_guid(spa, guid, B_TRUE)) == NULL)
 		return (spa_vdev_state_exit(spa, NULL, ENODEV));
 
+#if 0
 	if (!vd->vdev_ops->vdev_op_leaf)
 		return (spa_vdev_state_exit(spa, NULL, ENOTSUP));
+#endif
 
 	wasoffline = (vd->vdev_offline || vd->vdev_tmpoffline);
 	oldstate = vd->vdev_state;
